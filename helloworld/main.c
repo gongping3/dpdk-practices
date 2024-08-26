@@ -1,7 +1,3 @@
-/**
- * usage: ./helloworld -l 0-1 -n 4
-*/
-
 #include <stdlib.h>
 
 #include <rte_eal.h>
@@ -27,7 +23,7 @@ main(int argc, char** argv)
     unsigned lcore_id;
 
     ret = rte_eal_init(argc, argv);
-    if (ret != 0) {
+    if (ret < 0) {
         rte_panic("Cannot init EAL\n");
     }
     
