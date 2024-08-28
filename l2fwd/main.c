@@ -119,8 +119,6 @@ static uint64_t timer_period = 10; /* default period is 10 seconds */
 #define MBUF_PRIV_SIZE 0
 #define MBUF_DATA_SIZE RTE_MBUF_DEFAULT_BUF_SIZE
 
-uint32_t l2fwd_dst_ports[RTE_MAX_ETHPORTS];
-uint32_t nb_port_pair_params;
 
 enum {
 	/* long options mapped to a short option */
@@ -131,12 +129,136 @@ enum {
 	CMD_LINE_OPT_PORTMAP_NUM,
 };
 
+/* display usage */
+static void
+l2fwd_usage(const char *prgname)
+{
+	printf("%s [EAL options] -- -p PORTMASK [-P] [-q NQ]\n"
+	       "  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
+	       "  -P : Enable promiscuous mode\n"
+	       "  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
+	       "  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to disable, 10 default, 86400 maximum)\n"
+	       "  --no-mac-updating: Disable MAC addresses updating (enabled by default)\n"
+	       "      When enabled:\n"
+	       "       - The source MAC address is replaced by the TX port MAC address\n"
+	       "       - The destination MAC address is replaced by 02:00:00:00:00:TX_PORT_ID\n"
+	       "  --portmap: Configure forwarding port pair mapping\n"
+	       "	      Default: alternate port pairs\n\n",
+	       prgname);
+}
+
+static int
+l2fwd_parse_portmask(const char *portmask)
+{
+	char *end = NULL;
+	unsigned long pm;
+
+	/* parse hexadecimal string */
+	pm = strtoul(portmask, &end, 16);
+	if ((portmask[0] == '\0') || (end == NULL) || (*end != '\0'))
+		return 0;
+
+	return pm;
+}
+
+static int
+l2fwd_parse_port_pair_config(const char *q_arg)
+{
+	enum fieldnames {
+		FLD_PORT1 = 0,
+		FLD_PORT2,
+		_NUM_FLD
+	};
+	unsigned long int_fld[_NUM_FLD];
+	const char *p, *p0 = q_arg;
+	char *str_fld[_NUM_FLD];
+	unsigned int size;
+	char s[256];
+	char *end;
+	int i;
+
+	nb_port_pair_params = 0;
+
+	while ((p = strchr(p0, '(')) != NULL) {
+		++p;
+		p0 = strchr(p, ')');
+		if (p0 == NULL)
+			return -1;
+
+		size = p0 - p;
+		if (size >= sizeof(s))
+			return -1;
+
+		memcpy(s, p, size);
+		s[size] = '\0';
+		if (rte_strsplit(s, sizeof(s), str_fld,
+				 _NUM_FLD, ',') != _NUM_FLD)
+			return -1;
+		for (i = 0; i < _NUM_FLD; i++) {
+			errno = 0;
+			int_fld[i] = strtoul(str_fld[i], &end, 0);
+			if (errno != 0 || end == str_fld[i] ||
+			    int_fld[i] >= RTE_MAX_ETHPORTS)
+				return -1;
+		}
+		if (nb_port_pair_params >= RTE_MAX_ETHPORTS/2) {
+			printf("exceeded max number of port pair params: %hu\n",
+				nb_port_pair_params);
+			return -1;
+		}
+		port_pair_params_array[nb_port_pair_params].port[0] =
+				(uint16_t)int_fld[FLD_PORT1];
+		port_pair_params_array[nb_port_pair_params].port[1] =
+				(uint16_t)int_fld[FLD_PORT2];
+		++nb_port_pair_params;
+	}
+	port_pair_params = port_pair_params_array;
+	return 0;
+}
+
+static unsigned int
+l2fwd_parse_nqueue(const char *q_arg)
+{
+	char *end = NULL;
+	unsigned long n;
+
+	/* parse hexadecimal string */
+	n = strtoul(q_arg, &end, 10);
+	if ((q_arg[0] == '\0') || (end == NULL) || (*end != '\0'))
+		return 0;
+	if (n == 0)
+		return 0;
+	if (n >= MAX_RX_QUEUE_PER_LCORE)
+		return 0;
+
+	return n;
+}
+
+static int
+l2fwd_parse_timer_period(const char *q_arg)
+{
+	char *end = NULL;
+	int n;
+
+	/* parse number string */
+	n = strtol(q_arg, &end, 10);
+	if ((q_arg[0] == '\0') || (end == NULL) || (*end != '\0'))
+		return -1;
+	if (n >= MAX_TIMER_PERIOD)
+		return -1;
+
+	return n;
+}
+
 static const char short_options[] =
 	"p:"  /* portmask */
 	"P"   /* promiscuous */
 	"q:"  /* number of queues */
 	"T:"  /* timer period */
 	;
+
+#define CMD_LINE_OPT_NO_MAC_UPDATING "no-mac-updating"
+#define CMD_LINE_OPT_PORTMAP_CONFIG "portmap"
 
 static const struct option lgopts[] = {
 	{ CMD_LINE_OPT_NO_MAC_UPDATING, no_argument, 0,
@@ -223,21 +345,96 @@ l2fwd_parse_args(int argc, char **argv)
 	return ret;
 }
 
-void l2fwd_launch_one_lcore(__rte_unused void *dummy)
+void l2fwd_simple_forward(struct rte_mbuf* m, uint16_t portid) {
+	unsigned dst_port;
+	int sent;
+	struct rte_eth_dev_tx_buffer *buffer;
+
+	dst_port = l2fwd_dst_ports[portid];
+
+	// if (mac_updating)
+	// 	l2fwd_mac_updating(m, dst_port);
+
+	buffer = tx_buffer[dst_port];
+	sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
+}
+
+void l2fwd_main_loop()
+{
+    uint64_t cur_tsc;
+    uint64_t prev_tsc;
+    uint64_t diff_tsc;
+    uint64_t drain_tsc;
+    int i, j;
+    uint16_t sent, nb_rx;
+    uint32_t portid;
+    unsigned lcore_id;
+    struct rte_eth_dev_tx_buffer* buffer;
+    struct rte_mbuf** pkts_burst;
+    struct rte_mbuf* m;
+    struct lcore_queue_conf *qconf;
+
+    cur_tsc = 0;
+    prev_tsc = 0;
+
+    lcore_id = rte_lcore_id();
+	qconf = &lcore_queue_conf[lcore_id];
+
+    while (!force_quit) {
+        cur_tsc = rte_rdtsc();
+
+        /* TX burst queue drain */
+        diff_tsc = cur_tsc - prev_tsc;
+        if (diff_tsc > drain_tsc) {
+            for (i = 0; i < qconf->n_rx_port; i++) {
+                portid = l2fwd_dst_ports[qconf->rx_port_list[i]];
+                buffer = tx_buffer[portid];
+
+				sent = rte_eth_tx_buffer_flush(portid, 0, buffer);
+            }
+        
+            prev_tsc = cur_tsc;
+        }
+
+        for (i = 0; i < qconf->n_rx_port; i++) {
+            portid = qconf->rx_port_list[i];
+            nb_rx = rte_eth_rx_burst(portid, 0,
+                            pkts_burst, MAX_PKT_BURST);
+
+            if (nb_rx == 0)
+                continue;
+            
+            for (j = 0; j < nb_rx; j++) {
+                m = pkts_burst[j];
+                rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+                l2fwd_simple_forward(m, portid);            
+            }
+        } 
+    }  
+}
+
+int l2fwd_launch_one_lcore(__rte_unused void *dummy)
 {
 	l2fwd_main_loop();
 	return 0;
+}
+
+void signal_handler(int signum)
+{
+    if (signum == SIGINT || signum == SIGTERM) {
+    	printf("\n\nSignal %d received, preparing to exit...\n",
+			signum);
+        force_quit = true;
+    }
 }
 
 int main(int argc, char** argv)
 {
     int ret;
     struct rte_mempool* l2fwd_pktmbuf_pool;
-    int portid;
+    uint16_t portid;
     int last_port;
-    uint32_t l2fwd_enabled_port_mask;
     unsigned nb_ports_in_mask = 0;
-    int nb_port_available = 0;
     uint16_t nb_ports_available = 0;
     int lcore_id;
 
@@ -248,6 +445,11 @@ int main(int argc, char** argv)
     }
     argc -= ret;
     argv += ret;
+
+    /* init signal */
+    force_quit = false;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
     /* parse application arguments (after the EAL ones) */
     ret = l2fwd_parse_args(argc, argv);
@@ -300,6 +502,7 @@ int main(int argc, char** argv)
     }
     /* >8 End of create the mbuf pool */
    
+    portid = 0;
     RTE_ETH_FOREACH_DEV(portid) {
         struct rte_eth_rxconf rxq_conf;
         struct rte_eth_txconf txq_conf;
@@ -311,7 +514,7 @@ int main(int argc, char** argv)
             printf("Skipping disabled port %u\n", portid);
             continue;
         }
-        nb_port_available++;
+        nb_ports_available++;
 
         /* init port */
         printf("Initializing port %u...", portid);
